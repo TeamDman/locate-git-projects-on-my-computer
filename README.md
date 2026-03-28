@@ -11,7 +11,8 @@ The first real implementation slice is in place.
 - indexed discovery comes from Teamy MFT search indexes
 - `.git` and `Cargo.toml` markers are merged by project directory
 - git remotes and git author identities are gathered with `git2`
-- Cargo package repository and authors are gathered from `Cargo.toml`
+- Cargo package names, links, and authors are gathered from `Cargo.toml`
+- optional `--name`, `--author`, and `--url` filters narrow the emitted results
 
 ## Usage
 
@@ -29,11 +30,18 @@ Write logs to disk while keeping human-readable logs on stderr:
 cargo run -- --log-file .\logs
 ```
 
+Filter the emitted projects by exact discovered metadata values:
+
+```powershell
+cargo run -- --name locate-git-projects-on-my-computer --author "TeamDman" --url https://github.com/TeamDman/locate-git-projects-on-my-computer
+```
+
 ## Output Shape
 
 The default command emits a pretty-printed JSON array. Each element is intended to represent one discovered on-disk project entry with:
 
 - `path_on_disk`
+- `names`
 - `outlinks`
 - `authors`
 

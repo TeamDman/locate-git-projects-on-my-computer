@@ -7,6 +7,15 @@ This specification covers the current user-facing command line behavior exposed 
 cli[command.surface.default-discovery]
 The CLI must successfully run with no positional arguments or subcommands.
 
+cli[command.surface.named-filters]
+The CLI must support repeated named filters for project names, authors, and URLs.
+
+cli[command.surface.named-filters-or-semantics]
+When one or more name, author, or URL filters are supplied, a project must be included if it contains at least one requested value in any of those metadata collections.
+
+cli[command.surface.name-filter-dash-underscore-normalization]
+Name filter matching must treat `-` and `_` as equivalent so that values such as `rc-zip` and `rc_zip` match one another.
+
 cli[command.surface.default-json]
 When run with no positional arguments or subcommands, the CLI must write a pretty-printed JSON array to stdout.
 
@@ -64,10 +73,16 @@ For discovered git repositories, the implementation must gather author identitie
 cli[enrichment.cargo-manifest]
 For discovered Cargo projects, the implementation must parse `Cargo.toml` with `facet-toml` and gather package authors plus link metadata such as repository, homepage, and documentation when present.
 
+cli[enrichment.project-names]
+The implementation must gather project names from the containing directory name and from `Cargo.toml` package names when present.
+
 ## Output Shape
 
 cli[output.entry.path-on-disk]
 Each JSON array entry must contain exactly one `path_on_disk` field identifying the discovered location on disk.
+
+cli[output.entry.names]
+Each JSON array entry must contain a `names` field with zero or more project names gathered from directory names or package metadata.
 
 cli[output.entry.project-directory]
 For `.git` and `Cargo.toml` discoveries, `path_on_disk` must identify the containing project directory rather than the marker file or directory itself.
@@ -85,7 +100,7 @@ cli[output.entry.merge-by-path]
 When the same project directory is discovered from multiple marker types, the implementation must merge the metadata into a single output entry for that path.
 
 cli[output.entry.sorted-deduped-metadata]
-Each output entry should present authors and outlinks in a deterministic deduplicated order.
+Each output entry should present names, authors, and outlinks in a deterministic deduplicated order.
 
 cli[output.serialization.facet-json]
 The JSON output must be serialized with `facet-json` rather than `serde_json`.

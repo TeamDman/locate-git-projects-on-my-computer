@@ -28,7 +28,7 @@ const VERSION: &str = concat!(
 pub fn main() -> eyre::Result<()> {
     // Install color_eyre for better error reports
     color_eyre::install()?;
-    
+
     #[cfg(windows)]
     {
         // Enable ANSI support on Windows
@@ -39,7 +39,6 @@ pub fn main() -> eyre::Result<()> {
         #[cfg(windows)]
         teamy_windows::string::warn_if_utf8_not_enabled();
     };
-
 
     // Parse command line arguments using figue
     // unwrap() is figue's intended CLI entry behavior:

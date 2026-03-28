@@ -18,6 +18,8 @@ const MAX_GIT_COMMITS_TO_SCAN: usize = 10_000;
 pub struct DiscoveredProject {
     /// The on-disk path for this specific discovered project entry.
     pub path_on_disk: String,
+    /// Project names gathered from directory names or package metadata.
+    pub names: Vec<String>,
     /// Source repository or file URIs associated with this entry.
     pub outlinks: Vec<String>,
     /// Authors gathered from repository history or package metadata.
@@ -31,6 +33,7 @@ struct CargoManifest {
 
 #[derive(Facet, Debug, Clone, PartialEq, Eq, Default)]
 struct CargoPackage {
+    name: Option<String>,
     repository: Option<CargoStringField>,
     homepage: Option<CargoStringField>,
     documentation: Option<CargoStringField>,
@@ -67,6 +70,7 @@ enum DiscoverySeed {
 #[derive(Debug, Clone, Default)]
 struct PartialProject {
     path_on_disk: String,
+    names: BTreeSet<String>,
     outlinks: BTreeSet<String>,
     authors: BTreeSet<String>,
 }
@@ -175,6 +179,7 @@ fn enrich_git_seed(git_dir: &Path) -> eyre::Result<PartialProject> {
         path_on_disk: path_to_output_string(project_dir),
         ..Default::default()
     };
+    collect_path_name(project_dir, &mut project.names);
 
     match Repository::open(project_dir) {
         Ok(repository) => {
@@ -248,6 +253,7 @@ fn enrich_cargo_toml_seed(cargo_toml_path: &Path) -> eyre::Result<PartialProject
         path_on_disk: path_to_output_string(project_dir),
         ..Default::default()
     };
+    collect_path_name(project_dir, &mut project.names);
 
     let contents = std::fs::read_to_string(cargo_toml_path)
         .wrap_err_with(|| format!("failed reading {}", cargo_toml_path.display()))?;
@@ -255,6 +261,7 @@ fn enrich_cargo_toml_seed(cargo_toml_path: &Path) -> eyre::Result<PartialProject
     match facet_toml::from_str::<CargoManifest>(&contents) {
         Ok(manifest) => {
             if let Some(package) = manifest.package {
+                collect_cargo_name_field(package.name.as_deref(), &mut project.names);
                 collect_cargo_link_field(package.repository, &mut project.outlinks);
                 collect_cargo_link_field(package.homepage, &mut project.outlinks);
                 collect_cargo_link_field(package.documentation, &mut project.outlinks);
@@ -291,6 +298,20 @@ fn normalize_non_empty_string(value: &str) -> Option<String> {
 
 fn cargo_toml_looks_like_template(contents: &str) -> bool {
     contents.contains("{{") || contents.contains("}}")
+}
+
+fn collect_path_name(path: &Path, names: &mut BTreeSet<String>) {
+    if let Some(name) = path.file_name().and_then(std::ffi::OsStr::to_str)
+        && let Some(name) = normalize_non_empty_string(name)
+    {
+        names.insert(name);
+    }
+}
+
+fn collect_cargo_name_field(field: Option<&str>, names: &mut BTreeSet<String>) {
+    if let Some(name) = field.and_then(normalize_non_empty_string) {
+        names.insert(name);
+    }
 }
 
 fn collect_cargo_link_field(field: Option<CargoStringField>, outlinks: &mut BTreeSet<String>) {
@@ -340,6 +361,7 @@ fn merge_partials(partials: Vec<PartialProject>) -> Vec<DiscoveredProject> {
             path_on_disk: partial.path_on_disk.clone(),
             ..Default::default()
         });
+        entry.names.extend(partial.names);
         entry.outlinks.extend(partial.outlinks);
         entry.authors.extend(partial.authors);
     }
@@ -348,6 +370,7 @@ fn merge_partials(partials: Vec<PartialProject>) -> Vec<DiscoveredProject> {
         .into_values()
         .map(|partial| DiscoveredProject {
             path_on_disk: partial.path_on_disk,
+            names: partial.names.into_iter().collect(),
             outlinks: partial.outlinks.into_iter().collect(),
             authors: partial.authors.into_iter().collect(),
         })
@@ -377,12 +400,14 @@ mod tests {
     use super::merge_partials;
     use super::project_key;
     use std::collections::BTreeSet;
+    use std::path::Path;
 
     #[test]
-    fn parses_cargo_manifest_repository_and_authors() {
+    fn parses_cargo_manifest_name_repository_and_authors() {
         let manifest: CargoManifest = facet_toml::from_str(
             r#"
                 [package]
+                name = "example-repo"
                 repository = "https://github.com/example/repo"
                 homepage = "https://example.com/project"
                 documentation = "https://docs.rs/example"
@@ -392,6 +417,7 @@ mod tests {
         .expect("cargo manifest should parse");
 
         let package = manifest.package.expect("package table should exist");
+        assert_eq!(package.name.as_deref(), Some("example-repo"));
         assert_eq!(
             package.repository,
             Some(CargoStringField::Value(
@@ -492,6 +518,19 @@ mod tests {
     }
 
     #[test]
+    fn collects_path_and_cargo_names_into_names() {
+        let mut names = BTreeSet::new();
+
+        super::collect_path_name(Path::new(r"C:\Repos\example-repo"), &mut names);
+        super::collect_cargo_name_field(Some("crate-name"), &mut names);
+
+        assert_eq!(
+            names.into_iter().collect::<Vec<_>>(),
+            vec!["crate-name".to_owned(), "example-repo".to_owned()]
+        );
+    }
+
+    #[test]
     fn detects_template_placeholders_in_manifest_contents() {
         assert!(super::cargo_toml_looks_like_template(
             "name = \"{{crate_name}}\""
@@ -507,6 +546,7 @@ mod tests {
             path_on_disk: r"C:\Repo".to_owned(),
             ..Default::default()
         };
+        first.names = BTreeSet::from(["Repo".to_owned()]);
         first.outlinks = BTreeSet::from(["https://example.com/one".to_owned()]);
         first.authors = BTreeSet::from(["Ada <ada@example.com>".to_owned()]);
 
@@ -514,6 +554,7 @@ mod tests {
             path_on_disk: r"C:\Repo".to_owned(),
             ..Default::default()
         };
+        second.names = BTreeSet::from(["repo-crate".to_owned()]);
         second.outlinks = BTreeSet::from([
             "https://example.com/one".to_owned(),
             "https://example.com/two".to_owned(),
@@ -523,6 +564,10 @@ mod tests {
         let merged = merge_partials(vec![first, second]);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].path_on_disk, r"C:\Repo");
+        assert_eq!(
+            merged[0].names,
+            vec!["Repo".to_owned(), "repo-crate".to_owned()]
+        );
         assert_eq!(
             merged[0].outlinks,
             vec![
