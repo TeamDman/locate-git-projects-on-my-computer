@@ -1,0 +1,45 @@
+// repo[impl tracey.specification.present]
+@schema {id crate:tracey-config@1, cli tracey}
+
+specs (
+    {
+        name locate-git-projects-on-my-computer-publishing-standards
+        source_url https://github.com/TeamDman/locate-git-projects-on-my-computer
+        include (docs/spec/repo/**/*.md)
+        impls (
+            {
+                name repo
+                include_plain (
+                    README.md
+                    Cargo.toml
+                    LICENSE
+                    .config/tracey/config.styx
+                )
+            }
+        )
+    }
+    {
+        name locate-git-projects-on-my-computer-tool-standards
+        source_url https://github.com/TeamDman/locate-git-projects-on-my-computer
+        include (docs/spec/tools/**/*.md)
+        impls (
+            {
+                name rust
+                include (src/**/*.rs)
+                test_include (tests/**/*.rs)
+            }
+        )
+    }
+    {
+        name locate-git-projects-on-my-computer-cli
+        source_url https://github.com/TeamDman/locate-git-projects-on-my-computer
+        include (docs/spec/product/cli.md)
+        impls (
+            {
+                name rust
+                include (src/**/*.rs)
+                test_include (tests/**/*.rs)
+            }
+        )
+    }
+)
