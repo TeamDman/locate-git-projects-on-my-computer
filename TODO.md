@@ -23,3 +23,7 @@ The program must function by beginning with a teamy-mft query for directories na
 The program must use `teamy-mft` as a cargo dependency rather than invoking it using the shell.
 
 The program must use the existing `teamy-mft sync` files.
+
+migrate to https://github.com/GitoxideLabs/gitoxide
+
+identify git repos that have uncommitted or unpushed changes
