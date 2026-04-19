@@ -10,11 +10,20 @@ The CLI must successfully run with no positional arguments or subcommands.
 cli[command.surface.named-filters]
 The CLI must support repeated named filters for project names, authors, and URLs.
 
+cli[command.surface.discovery-tuning-flags]
+The CLI should accept optional named tuning flags for enrichment parallelism and git author scanning.
+
 cli[command.surface.named-filters-or-semantics]
 When one or more name, author, or URL filters are supplied, a project must be included if it contains at least one requested value in any of those metadata collections.
 
 cli[command.surface.name-filter-dash-underscore-normalization]
 Name filter matching must treat `-` and `_` as equivalent so that values such as `rc-zip` and `rc_zip` match one another.
+
+cli[command.surface.author-filter-case-insensitive-substring]
+Author filter matching must treat the provided value as a case-insensitive substring of a discovered author string rather than requiring full-string equality.
+
+cli[command.surface.activity-filter]
+When `--activity` is provided, the CLI must keep only git repositories whose branch tips reach at least one commit newer than now minus the provided humantime duration.
 
 cli[command.surface.default-json]
 When run with no positional arguments or subcommands, the CLI must write a pretty-printed JSON array to stdout.
@@ -50,6 +59,9 @@ The initial implementation must use Teamy MFT indexed lookup for `.git$` and the
 cli[discovery.query-pattern.cargo-toml]
 The initial implementation must use Teamy MFT indexed lookup for `Cargo.toml$` and then filter results to exact files named `Cargo.toml`.
 
+cli[discovery.parallel-candidate-queries]
+The indexed candidate lookups for `.git` directories and `Cargo.toml` files should be able to run concurrently before metadata enrichment begins.
+
 cli[discovery.serial-query-phase]
 The initial MFT-backed discovery phase should complete before the metadata-enrichment phase starts so the implementation stays simple.
 
@@ -61,14 +73,20 @@ Metadata enrichment failures for an individual discovered project should not abo
 
 ## Metadata Enrichment
 
-cli[enrichment.git2-repository-metadata]
-For discovered git repositories, the implementation must use the `git2` crate rather than shelling out to the `git` command in order to gather repository metadata.
+cli[enrichment.gix-repository-metadata]
+For discovered git repositories, the implementation must use the `gix` crate rather than shelling out to the `git` command in order to gather repository metadata.
 
 cli[enrichment.git-remotes]
 For discovered git repositories, the implementation must gather outlinks from configured git remotes.
 
 cli[enrichment.git-authors]
 For discovered git repositories, the implementation must gather author identities from reachable local commit history.
+
+cli[enrichment.git-author-scan-minimum]
+For discovered git repositories, author scanning must inspect at least the configured minimum number of reachable commits before time budgeting can stop the walk.
+
+cli[enrichment.git-author-scan-budget]
+After the configured minimum scan depth is satisfied, git author scanning should stop once the per-repository time budget is exhausted.
 
 cli[enrichment.cargo-manifest]
 For discovered Cargo projects, the implementation must parse `Cargo.toml` with `facet-toml` and gather package authors plus link metadata such as repository, homepage, and documentation when present.
@@ -92,6 +110,12 @@ Each JSON array entry must contain an `outlinks` field with zero or more URI str
 
 cli[output.entry.authors]
 Each JSON array entry must contain an `authors` field with zero or more author strings gathered from git history or package metadata.
+
+cli[output.entry.last-activity-on]
+Each JSON array entry must contain a `last_activity_on` field. When branch activity metadata is available, it must be an RFC 3339 timestamp for the newest discovered branch-tip-reachable commit; otherwise it must be `null`.
+
+cli[output.entry.last-activity-ago]
+Each JSON array entry must contain a `last_activity_ago` field. When branch activity metadata is available, it must describe the same newest discovered commit relative to when the command ran; otherwise it must be `null`.
 
 cli[output.entry.authors.git-style]
 When both a display name and email are available for an author, the author string should use git-style formatting such as `Name <email@example.com>`.

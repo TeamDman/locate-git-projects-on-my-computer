@@ -2,7 +2,7 @@
 
 Locate source projects on disk by combining git repository signals with package metadata discovered from files such as `Cargo.toml`.
 
-The current implementation uses `teamy-mft` as the indexed discovery backend, then enriches each discovered project path with git metadata from `git2` and Cargo metadata from `facet-toml`.
+The current implementation uses `teamy-mft` as the indexed discovery backend, then enriches each discovered project path with git metadata from `gix` and Cargo metadata from `facet-toml`.
 
 ## Current Status
 
@@ -10,7 +10,7 @@ The first real implementation slice is in place.
 
 - indexed discovery comes from Teamy MFT search indexes
 - `.git` and `Cargo.toml` markers are merged by project directory
-- git remotes and git author identities are gathered with `git2`
+- git remotes, git author identities, and last observed branch activity are gathered with `gix`
 - Cargo package names, links, and authors are gathered from `Cargo.toml`
 - optional `--name`, `--author`, and `--url` filters narrow the emitted results
 
@@ -44,6 +44,8 @@ The default command emits a pretty-printed JSON array. Each element is intended 
 - `names`
 - `outlinks`
 - `authors`
+- `last_activity_on`
+- `last_activity_ago`
 
 ## Environment Variables
 

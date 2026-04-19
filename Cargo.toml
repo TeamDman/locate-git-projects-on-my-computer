@@ -1,6 +1,6 @@
 [package]
 name = "locate-git-projects-on-my-computer"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 authors = ["TeamDman"]
 description = "Locate source projects on disk by combining git repository hints and Cargo.toml metadata."
@@ -24,13 +24,14 @@ tokio = { version = "1.49.0", features = ["full"] }
 facet = "0.44.1"
 facet-json = "0.44.1"
 facet-toml = "0.44.1"
-figue = { git = "https://github.com/TeamDman/figue", rev = "0e82172c21e9ce0ecc4521ff01f6dbf56342867f", features = ["arbitrary"] }
-git2 = { path = "../git2-rs" }
+figue = { package = "teamy-figue", version = "2.0.2", features = ["arbitrary"] }
+gix = "0.81.0"
+humantime = "2.2.0"
 open = "5"
-teamy-mft = { path = "../teamy-mft" }
+teamy-mft = "0.5.1"
 
 [target.'cfg(windows)'.dependencies]
-teamy-windows = "0.9.0"
+teamy-windows = "0.11.1"
 
 [features]
 default = []
