@@ -273,14 +273,12 @@ async fn join_next_partial(
 async fn discover_candidate_paths() -> eyre::Result<Vec<DiscoverySeed>> {
     let git_dirs_task = tokio::task::spawn_blocking(|| {
         let _span = info_span!("query_git_directories").entered();
-        teamy_mft::cli::command::query::QueryArgs::new(GIT_QUERY_PATTERN)
-            .invoke()
+        query_teamy_mft_paths(GIT_QUERY_PATTERN)
             .wrap_err("failed querying Teamy MFT index for .git directories")
     });
     let cargo_tomls_task = tokio::task::spawn_blocking(|| {
         let _span = info_span!("query_cargo_toml_files").entered();
-        teamy_mft::cli::command::query::QueryArgs::new(CARGO_TOML_QUERY_PATTERN)
-            .invoke()
+        query_teamy_mft_paths(CARGO_TOML_QUERY_PATTERN)
             .wrap_err("failed querying Teamy MFT index for Cargo.toml files")
     });
 
@@ -308,6 +306,12 @@ async fn discover_candidate_paths() -> eyre::Result<Vec<DiscoverySeed>> {
         "discovered candidate project markers"
     );
     Ok(seeds)
+}
+
+fn query_teamy_mft_paths(pattern: &str) -> eyre::Result<Vec<PathBuf>> {
+    teamy_mft::cli::command::query::QueryArgs::new(pattern)
+        .collect_rows()
+        .map(|rows| rows.into_iter().map(|row| row.path.into()).collect())
 }
 
 async fn join_query_task(
