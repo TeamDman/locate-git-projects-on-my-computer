@@ -8,14 +8,16 @@ use std::path::PathBuf;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
+use teamy_mft::query::QueryNeedle;
+use teamy_mft::query::QueryPlan;
+use teamy_mft::query::QueryRule;
+use teamy_mft::query::QueryRuntime;
 use tokio::task::JoinHandle;
 use tokio::task::JoinSet;
 use tracing::debug;
 use tracing::info_span;
 use tracing::warn;
 
-const GIT_QUERY_PATTERN: &str = ".git$";
-const CARGO_TOML_QUERY_PATTERN: &str = "Cargo.toml$";
 const DEFAULT_ENRICHMENT_MAX_IN_FLIGHT: usize = 64;
 const DEFAULT_AUTHOR_MIN_COMMITS: usize = 1;
 const DEFAULT_AUTHOR_SCAN_CHUNK_SIZE: usize = 64;
@@ -164,6 +166,27 @@ enum DiscoverySeed {
     CargoToml(PathBuf),
 }
 
+#[derive(Debug, Clone, Copy)]
+enum DiscoveryMarker {
+    GitDir,
+    CargoToml,
+}
+
+impl DiscoveryMarker {
+    const fn terminal_segment(self) -> &'static str {
+        match self {
+            Self::GitDir => ".git",
+            Self::CargoToml => "Cargo.toml",
+        }
+    }
+
+    fn query_plan(self) -> QueryPlan {
+        QueryPlan::single_rule(QueryRule::EqualsCaseInsensitive(QueryNeedle::new(
+            self.terminal_segment(),
+        )))
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct PartialProject {
     path_on_disk: String,
@@ -273,12 +296,12 @@ async fn join_next_partial(
 async fn discover_candidate_paths() -> eyre::Result<Vec<DiscoverySeed>> {
     let git_dirs_task = tokio::task::spawn_blocking(|| {
         let _span = info_span!("query_git_directories").entered();
-        query_teamy_mft_paths(GIT_QUERY_PATTERN)
+        query_teamy_mft_paths(DiscoveryMarker::GitDir)
             .wrap_err("failed querying Teamy MFT index for .git directories")
     });
     let cargo_tomls_task = tokio::task::spawn_blocking(|| {
         let _span = info_span!("query_cargo_toml_files").entered();
-        query_teamy_mft_paths(CARGO_TOML_QUERY_PATTERN)
+        query_teamy_mft_paths(DiscoveryMarker::CargoToml)
             .wrap_err("failed querying Teamy MFT index for Cargo.toml files")
     });
 
@@ -308,9 +331,11 @@ async fn discover_candidate_paths() -> eyre::Result<Vec<DiscoverySeed>> {
     Ok(seeds)
 }
 
-fn query_teamy_mft_paths(pattern: &str) -> eyre::Result<Vec<PathBuf>> {
-    teamy_mft::cli::command::query::QueryArgs::new(pattern)
-        .collect_rows()
+fn query_teamy_mft_paths(marker: DiscoveryMarker) -> eyre::Result<Vec<PathBuf>> {
+    let query_plan = marker.query_plan();
+    query_plan.ensure_selected_profile_allowed()?;
+    QueryRuntime::published_index_only()
+        .collect_rows(query_plan)
         .map(|rows| rows.into_iter().map(|row| row.path.into()).collect())
 }
 

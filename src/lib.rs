@@ -5,16 +5,34 @@ pub mod cli;
 pub mod discovery;
 pub mod logging_init;
 pub mod paths;
+#[cfg(windows)]
+mod windows_startup;
 
 use crate::cli::Cli;
+use chrono::{DateTime, Local, Utc};
 
-/// Version string combining package version and git revision.
-const VERSION: &str = concat!(
-    env!("CARGO_PKG_VERSION"),
-    " (rev ",
-    env!("GIT_REVISION"),
-    ")"
-);
+/// Version string components embedded by Cargo and the build script.
+pub const APP_SEMVER: &str = env!("CARGO_PKG_VERSION");
+pub const APP_GIT_REVISION: &str = env!("GIT_REVISION");
+pub const APP_BUILD_UNIX_MS: &str = env!("BUILD_UNIX_MS");
+
+fn version() -> String {
+    let built_at = APP_BUILD_UNIX_MS
+        .parse::<i64>()
+        .ok()
+        .and_then(DateTime::<Utc>::from_timestamp_millis)
+        .map_or_else(
+            || String::from("unknown build time"),
+            |timestamp| {
+                timestamp
+                    .with_timezone(&Local)
+                    .format("%Y-%m-%d %H:%M:%S %Z")
+                    .to_string()
+            },
+        );
+
+    format!("{APP_SEMVER} (rev {APP_GIT_REVISION}, built {built_at})")
+}
 
 /// Entrypoint for the program.
 ///
@@ -33,22 +51,23 @@ pub fn main() -> eyre::Result<()> {
     {
         // Enable ANSI support on Windows
         // This fails in a pipe scenario, so we ignore the error
-        let _ = teamy_windows::console::enable_ansi_support();
+        let _ = windows_startup::enable_ansi_support();
 
         // Warn if UTF-8 is not enabled on Windows
         #[cfg(windows)]
-        teamy_windows::string::warn_if_utf8_not_enabled();
+        windows_startup::warn_if_utf8_not_enabled();
     };
 
     // Parse command line arguments using figue
     // unwrap() is figue's intended CLI entry behavior:
     // it exits with proper codes for --help/--version/completions/parse-errors.
+    let version = version();
     let cli: Cli = figue::Driver::new(
         figue::builder::<Cli>()
             .expect("schema should be valid")
             .cli(move |cli| cli.args_os(std::env::args_os().skip(1)).strict())
             .help(move |help| {
-                help.version(VERSION)
+                help.version(version)
                     .include_implementation_source_file(true)
                     .include_implementation_git_url(
                         "TeamDman/locate-git-projects-on-my-computer",
