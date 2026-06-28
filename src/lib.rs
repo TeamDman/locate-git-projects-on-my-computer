@@ -9,7 +9,10 @@ pub mod paths;
 mod windows_startup;
 
 use crate::cli::Cli;
-use chrono::{DateTime, Local, Utc};
+use chrono::DateTime;
+use chrono::Local;
+use chrono::Utc;
+use teamy_cancellation::CtrlCHandler;
 
 /// Version string components embedded by Cargo and the build script.
 pub const APP_SEMVER: &str = env!("CARGO_PKG_VERSION");
@@ -46,6 +49,7 @@ fn version() -> String {
 pub fn main() -> eyre::Result<()> {
     // Install color_eyre for better error reports
     color_eyre::install()?;
+    let cancellation_token = CtrlCHandler::default().install()?;
 
     #[cfg(windows)]
     {
@@ -80,9 +84,10 @@ pub fn main() -> eyre::Result<()> {
     .unwrap();
 
     // Initialize logging
-    logging_init::init_logging(&cli.global_args)?;
+    logging_init::init_logging(&cli.global_args, cancellation_token.clone())?;
 
     // Invoke whatever command was requested
-    cli.invoke()?;
+    cli.invoke(cancellation_token.clone())?;
+    cancellation_token.bail_if_cancelled()?;
     Ok(())
 }

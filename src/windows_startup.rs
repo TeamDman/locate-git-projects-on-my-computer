@@ -19,7 +19,7 @@ pub fn enable_ansi_support() -> eyre::Result<()> {
 
     let mut mode = CONSOLE_MODE::default();
     // SAFETY: `handle` was validated above, and `mode` is a valid out-parameter for the duration of the call.
-    unsafe { GetConsoleMode(handle, &mut mode) }.wrap_err("failed to get console mode")?;
+    unsafe { GetConsoleMode(handle, &raw mut mode) }.wrap_err("failed to get console mode")?;
     // SAFETY: `handle` was validated above, and the new mode is the existing mode with one documented flag added.
     unsafe { SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) }
         .wrap_err("failed to set console mode")?;

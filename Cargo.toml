@@ -21,6 +21,7 @@ tracing-subscriber = { version = "0.3.19", features = ["env-filter", "json"] }
 tracing-tracy = { version = "0.11", optional = true }
 directories-next = "2"
 tokio = { version = "1.49.0", features = ["full"] }
+teamy-cancellation = "=0.2.0"
 facet = "=0.46.5"
 facet-json = "=0.46.1"
 facet-toml = "=0.46.1"

@@ -11,8 +11,9 @@ The first real implementation slice is in place.
 - indexed discovery comes from Teamy MFT search indexes
 - `.git` and `Cargo.toml` markers are merged by project directory
 - git remotes, git author identities, and last observed branch activity are gathered with `gix`
+- git dirty/ahead state is gathered with `gix`
 - Cargo package names, links, and authors are gathered from `Cargo.toml`
-- optional `--name`, `--author`, and `--url` filters narrow the emitted results
+- optional metadata and repo-state filters narrow the emitted results
 
 ## Usage
 
@@ -36,6 +37,19 @@ Filter the emitted projects by exact discovered metadata values:
 cargo run -- --name locate-git-projects-on-my-computer --author "TeamDman" --url https://github.com/TeamDman/locate-git-projects-on-my-computer
 ```
 
+Filter by repository state:
+
+```powershell
+cargo run -- --dirty
+cargo run -- --ahead
+cargo run -- --ahead-or-dirty
+cargo run -- --no-upstream
+```
+
+Repo-state filters combine with metadata filters by conjunction. For example, `--author TeamDman --dirty` keeps projects that match the author filter and are dirty.
+
+Dirty means staged changes, unstaged tracked changes, or untracked non-ignored files. Ahead means at least one local commit is not reachable from any remote ref. `--no-upstream` is a separate current-branch upstream filter and does not imply `--ahead`.
+
 ## Output Shape
 
 The default command emits a pretty-printed JSON array. Each element is intended to represent one discovered on-disk project entry with:
@@ -46,6 +60,8 @@ The default command emits a pretty-printed JSON array. Each element is intended 
 - `authors`
 - `last_activity_on`
 - `last_activity_ago`
+- `is_dirty`
+- `is_ahead`
 
 ## Environment Variables
 

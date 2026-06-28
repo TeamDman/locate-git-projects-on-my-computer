@@ -24,4 +24,8 @@ pub struct GlobalArgs {
     /// If omitted, no JSON log file is written.
     #[facet(args::named)]
     pub log_file: Option<String>,
+
+    /// Request graceful cancellation after a matching tracing span closes or event message appears.
+    #[facet(args::named)]
+    pub stop_after: Option<String>,
 }

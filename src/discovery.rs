@@ -1,6 +1,7 @@
 use eyre::Context;
 use facet::Facet;
 use gix::Repository;
+use gix::traverse::commit::simple::CommitTimeOrder;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -8,6 +9,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
+use teamy_cancellation::CancellationToken;
 use teamy_mft::query::QueryNeedle;
 use teamy_mft::query::QueryPlan;
 use teamy_mft::query::QueryRule;
@@ -34,6 +36,7 @@ pub struct DiscoveryConfig {
     pub author_scan_budget: Duration,
     pub author_scan_chunk_size: usize,
     pub activity_cutoff: Option<SystemTime>,
+    pub repo_state: RepoStateRequirements,
 }
 
 impl Default for DiscoveryConfig {
@@ -44,6 +47,7 @@ impl Default for DiscoveryConfig {
             author_scan_budget: DEFAULT_AUTHOR_SCAN_BUDGET,
             author_scan_chunk_size: DEFAULT_AUTHOR_SCAN_CHUNK_SIZE,
             activity_cutoff: None,
+            repo_state: RepoStateRequirements::default(),
         }
     }
 }
@@ -56,17 +60,18 @@ impl DiscoveryConfig {
         author_scan_budget_ms: Option<u64>,
         author_scan_chunk_size: Option<usize>,
         activity_cutoff: Option<SystemTime>,
+        repo_state: RepoStateRequirements,
     ) -> Self {
         let defaults = Self::default();
         Self {
             max_in_flight: max_in_flight.or(defaults.max_in_flight),
             author_min_commits: author_min_commits.unwrap_or(DEFAULT_AUTHOR_MIN_COMMITS),
             author_scan_budget: author_scan_budget_ms
-                .map(Duration::from_millis)
-                .unwrap_or(DEFAULT_AUTHOR_SCAN_BUDGET),
+                .map_or(DEFAULT_AUTHOR_SCAN_BUDGET, Duration::from_millis),
             author_scan_chunk_size: author_scan_chunk_size
                 .unwrap_or(DEFAULT_AUTHOR_SCAN_CHUNK_SIZE),
             activity_cutoff,
+            repo_state,
         }
         .sanitized()
     }
@@ -79,14 +84,23 @@ impl DiscoveryConfig {
             author_scan_budget: self.author_scan_budget,
             author_scan_chunk_size: self.author_scan_chunk_size.max(1),
             activity_cutoff: self.activity_cutoff,
+            repo_state: self.repo_state,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RepoStateRequirements {
+    pub dirty: bool,
+    pub ahead: bool,
+    pub upstream: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveredProjectRecord {
     pub project: DiscoveredProject,
     pub newest_branch_activity_at: Option<SystemTime>,
+    pub has_upstream: Option<bool>,
 }
 
 impl DiscoveredProjectRecord {
@@ -100,8 +114,10 @@ impl DiscoveredProjectRecord {
         let Self {
             mut project,
             newest_branch_activity_at,
+            ..
         } = self;
-        let (last_activity_on, last_activity_ago) = activity_output_fields(newest_branch_activity_at, now);
+        let (last_activity_on, last_activity_ago) =
+            activity_output_fields(newest_branch_activity_at, now);
         project.last_activity_on = last_activity_on;
         project.last_activity_ago = last_activity_ago;
         project
@@ -123,6 +139,10 @@ pub struct DiscoveredProject {
     pub last_activity_on: Option<String>,
     /// The newest discovered branch activity relative to when the command ran.
     pub last_activity_ago: Option<String>,
+    /// Whether tracked changes, staged changes, or untracked non-ignored files were found.
+    pub is_dirty: Option<bool>,
+    /// Whether any local commit is not reachable from any remote ref.
+    pub is_ahead: Option<bool>,
 }
 
 #[derive(Facet, Debug, Clone, PartialEq, Eq, Default)]
@@ -194,6 +214,9 @@ struct PartialProject {
     outlinks: BTreeSet<String>,
     authors: BTreeSet<String>,
     newest_branch_activity_at: Option<SystemTime>,
+    is_dirty: Option<bool>,
+    is_ahead: Option<bool>,
+    has_upstream: Option<bool>,
 }
 
 /// Discover source projects on disk.
@@ -208,15 +231,21 @@ struct PartialProject {
 /// such as when Teamy MFT has no configured sync directory or no readable index
 /// data is available.
 pub async fn discover_projects() -> eyre::Result<Vec<DiscoveredProject>> {
-    discover_projects_with_config(DiscoveryConfig::default()).await
+    discover_projects_with_config(DiscoveryConfig::default(), CancellationToken::new()).await
 }
 
+/// Discover source project records on disk with an explicit discovery configuration.
+///
+/// # Errors
+///
+/// This function will return an error if candidate discovery or metadata enrichment fails.
 pub async fn discover_project_records_with_config(
     config: DiscoveryConfig,
+    cancellation_token: CancellationToken,
 ) -> eyre::Result<Vec<DiscoveredProjectRecord>> {
     let config = config.sanitized();
-    let author_scan_budget_ms = u64::try_from(config.author_scan_budget.as_millis())
-        .unwrap_or(u64::MAX);
+    let author_scan_budget_ms =
+        u64::try_from(config.author_scan_budget.as_millis()).unwrap_or(u64::MAX);
     let _span = info_span!(
         "discover_projects",
         max_in_flight = config.max_in_flight.unwrap_or(0),
@@ -224,13 +253,18 @@ pub async fn discover_project_records_with_config(
         author_scan_budget_ms,
         author_scan_chunk_size = config.author_scan_chunk_size,
         activity_filter = config.activity_cutoff.is_some(),
+        dirty_state = config.repo_state.dirty,
+        ahead_state = config.repo_state.ahead,
+        upstream_state = config.repo_state.upstream,
     )
     .entered();
+    cancellation_token.bail_if_cancelled()?;
 
     let seeds = {
         let _span = info_span!("discover_candidate_paths").entered();
-        discover_candidate_paths().await?
+        discover_candidate_paths(cancellation_token.clone()).await?
     };
+    cancellation_token.bail_if_cancelled()?;
     let mut partials = Vec::with_capacity(seeds.len());
     let mut join_set = JoinSet::new();
 
@@ -243,14 +277,17 @@ pub async fn discover_project_records_with_config(
         .entered();
 
         for seed in seeds {
+            cancellation_token.bail_if_cancelled()?;
             while config
                 .max_in_flight
                 .is_some_and(|max_in_flight| join_set.len() >= max_in_flight)
             {
                 partials.push(join_next_partial(&mut join_set).await?);
+                cancellation_token.bail_if_cancelled()?;
             }
 
-            join_set.spawn_blocking(move || enrich_seed(seed, config));
+            let cancellation_token = cancellation_token.clone();
+            join_set.spawn_blocking(move || enrich_seed(seed, config, &cancellation_token));
         }
     }
 
@@ -258,11 +295,14 @@ pub async fn discover_project_records_with_config(
         let _span = info_span!("collect_enrichment_results").entered();
         while !join_set.is_empty() {
             partials.push(join_next_partial(&mut join_set).await?);
+            cancellation_token.bail_if_cancelled()?;
         }
     }
 
-    Ok(info_span!("merge_discovered_projects", partials = partials.len())
-        .in_scope(|| merge_partials(partials, config.activity_cutoff)))
+    Ok(
+        info_span!("merge_discovered_projects", partials = partials.len())
+            .in_scope(|| merge_partials(partials, config.activity_cutoff)),
+    )
 }
 
 // cli[discovery.parallel-candidate-queries]
@@ -270,15 +310,23 @@ pub async fn discover_project_records_with_config(
 // cli[discovery.best-effort-enrichment]
 // tool[profiling.discovery-phases-spanned]
 // tool[profiling.discovery-bounded-fields]
+/// Discover source projects on disk with an explicit discovery configuration.
+///
+/// # Errors
+///
+/// This function will return an error if candidate discovery or metadata enrichment fails.
 pub async fn discover_projects_with_config(
     config: DiscoveryConfig,
+    cancellation_token: CancellationToken,
 ) -> eyre::Result<Vec<DiscoveredProject>> {
     let now = SystemTime::now();
-    Ok(discover_project_records_with_config(config)
-        .await?
-        .into_iter()
-        .map(|record| record.into_project_at(now))
-        .collect())
+    Ok(
+        discover_project_records_with_config(config, cancellation_token)
+            .await?
+            .into_iter()
+            .map(|record| record.into_project_at(now))
+            .collect(),
+    )
 }
 
 async fn join_next_partial(
@@ -293,7 +341,10 @@ async fn join_next_partial(
 
 // cli[discovery.query-pattern.git]
 // cli[discovery.query-pattern.cargo-toml]
-async fn discover_candidate_paths() -> eyre::Result<Vec<DiscoverySeed>> {
+async fn discover_candidate_paths(
+    cancellation_token: CancellationToken,
+) -> eyre::Result<Vec<DiscoverySeed>> {
+    cancellation_token.bail_if_cancelled()?;
     let git_dirs_task = tokio::task::spawn_blocking(|| {
         let _span = info_span!("query_git_directories").entered();
         query_teamy_mft_paths(DiscoveryMarker::GitDir)
@@ -309,6 +360,7 @@ async fn discover_candidate_paths() -> eyre::Result<Vec<DiscoverySeed>> {
         join_query_task(git_dirs_task, ".git directories"),
         join_query_task(cargo_tomls_task, "Cargo.toml files"),
     )?;
+    cancellation_token.bail_if_cancelled()?;
 
     let mut seeds = Vec::with_capacity(git_dirs.len() + cargo_tomls.len());
 
@@ -363,9 +415,14 @@ fn file_name_equals_ascii(path: &Path, expected: &str) -> bool {
 
 // tool[profiling.hot-loop-spans-tracy-gated]
 #[cfg_attr(feature = "tracy", tracing::instrument(level = "debug", skip_all))]
-fn enrich_seed(seed: DiscoverySeed, config: DiscoveryConfig) -> eyre::Result<PartialProject> {
+fn enrich_seed(
+    seed: DiscoverySeed,
+    config: DiscoveryConfig,
+    cancellation_token: &CancellationToken,
+) -> eyre::Result<PartialProject> {
+    cancellation_token.bail_if_cancelled()?;
     match seed {
-        DiscoverySeed::GitDir(git_dir) => enrich_git_seed(&git_dir, config),
+        DiscoverySeed::GitDir(git_dir) => enrich_git_seed(&git_dir, config, cancellation_token),
         DiscoverySeed::CargoToml(cargo_toml) => enrich_cargo_toml_seed(&cargo_toml),
     }
 }
@@ -376,7 +433,11 @@ fn enrich_seed(seed: DiscoverySeed, config: DiscoveryConfig) -> eyre::Result<Par
 // cli[enrichment.git-author-scan-minimum]
 // cli[enrichment.git-author-scan-budget]
 #[cfg_attr(feature = "tracy", tracing::instrument(level = "debug", skip_all))]
-fn enrich_git_seed(git_dir: &Path, config: DiscoveryConfig) -> eyre::Result<PartialProject> {
+fn enrich_git_seed(
+    git_dir: &Path,
+    config: DiscoveryConfig,
+    cancellation_token: &CancellationToken,
+) -> eyre::Result<PartialProject> {
     let Some(project_dir) = git_dir.parent() else {
         eyre::bail!("git directory has no parent: {}", git_dir.display())
     };
@@ -392,15 +453,110 @@ fn enrich_git_seed(git_dir: &Path, config: DiscoveryConfig) -> eyre::Result<Part
             #[cfg(feature = "tracy")]
             let _span = tracing::debug_span!("collect_git_repository_metadata").entered();
             collect_git_outlinks(&repository, &mut project.outlinks);
-            collect_git_authors(&repository, &mut project.authors, config);
-            project.newest_branch_activity_at = newest_branch_activity_at(&repository, config.activity_cutoff);
+            collect_git_authors(
+                &repository,
+                &mut project.authors,
+                config,
+                cancellation_token,
+            )?;
+            cancellation_token.bail_if_cancelled()?;
+            project.newest_branch_activity_at =
+                newest_branch_activity_at(&repository, config.activity_cutoff);
+            cancellation_token.bail_if_cancelled()?;
+            collect_repo_state(&repository, &mut project, config.repo_state);
         }
         Err(error) => {
-            warn!(path = %project_dir.display(), %error, "failed opening git repository for metadata enrichment");
+            debug!(path = %project_dir.display(), %error, "failed opening git repository for metadata enrichment");
         }
     }
 
     Ok(project)
+}
+
+// cli[enrichment.git-repo-state]
+fn collect_repo_state(
+    repository: &Repository,
+    project: &mut PartialProject,
+    requirements: RepoStateRequirements,
+) {
+    if requirements.dirty {
+        project.is_dirty = repository_is_dirty(repository);
+    }
+    if requirements.ahead {
+        project.is_ahead = repository_is_ahead(repository);
+    }
+    if requirements.upstream {
+        project.has_upstream = repository_has_upstream(repository);
+    }
+}
+
+fn repository_is_dirty(repository: &Repository) -> Option<bool> {
+    let mut iter = repository
+        .status(gix::progress::Discard)
+        .ok()?
+        .untracked_files(gix::status::UntrackedFiles::Files)
+        .into_iter(Vec::new())
+        .ok()?;
+
+    iter.any(|item| item.is_ok()).into()
+}
+
+fn repository_is_ahead(repository: &Repository) -> Option<bool> {
+    let local_tip_ids = local_tip_ids(repository);
+    if local_tip_ids.is_empty() {
+        return Some(false);
+    }
+
+    let remote_tip_ids = remote_tip_ids(repository);
+    let mut walk = repository
+        .rev_walk(local_tip_ids)
+        .with_hidden(remote_tip_ids)
+        .all()
+        .ok()?;
+
+    Some(walk.any(|info| info.is_ok()))
+}
+
+fn repository_has_upstream(repository: &Repository) -> Option<bool> {
+    let head = repository.head().ok()?;
+    let Some(reference) = head.try_into_referent() else {
+        return Some(false);
+    };
+    reference
+        .remote_tracking_ref_name(gix::remote::Direction::Fetch)
+        .map(|result| result.is_ok())
+        .or(Some(false))
+}
+
+fn local_tip_ids(repository: &Repository) -> Vec<gix::ObjectId> {
+    let mut tip_ids = Vec::new();
+    let Ok(references) = repository.references() else {
+        return tip_ids;
+    };
+
+    collect_branch_tip_ids(references.local_branches().ok(), &mut tip_ids);
+
+    if let Ok(head) = repository.head()
+        && let Some(id) = head.id()
+    {
+        tip_ids.push(id.detach());
+    }
+
+    tip_ids.sort();
+    tip_ids.dedup();
+    tip_ids
+}
+
+fn remote_tip_ids(repository: &Repository) -> Vec<gix::ObjectId> {
+    let mut tip_ids = Vec::new();
+    let Ok(references) = repository.references() else {
+        return tip_ids;
+    };
+
+    collect_branch_tip_ids(references.remote_branches().ok(), &mut tip_ids);
+    tip_ids.sort();
+    tip_ids.dedup();
+    tip_ids
 }
 
 fn collect_git_outlinks(repository: &Repository, outlinks: &mut BTreeSet<String>) {
@@ -429,28 +585,33 @@ fn collect_git_authors(
     repository: &Repository,
     authors: &mut BTreeSet<String>,
     config: DiscoveryConfig,
-) {
+    cancellation_token: &CancellationToken,
+) -> eyre::Result<()> {
     let Ok(head_commit) = repository.head_commit() else {
-        return;
+        return Ok(());
     };
     let Ok(mut rev_walk) = repository
         .rev_walk([head_commit.id])
-        .sorting(gix::revision::walk::Sorting::ByCommitTime(Default::default()))
+        .sorting(gix::revision::walk::Sorting::ByCommitTime(
+            CommitTimeOrder::default(),
+        ))
         .all()
     else {
-        return;
+        return Ok(());
     };
 
     let started_at = Instant::now();
     let mut scanned_commits = 0usize;
 
     while should_continue_author_scan(scanned_commits, started_at, config) {
+        cancellation_token.bail_if_cancelled()?;
         let chunk_limit = next_author_scan_chunk_limit(scanned_commits, config);
         let mut scanned_in_chunk = 0usize;
 
         while scanned_in_chunk < chunk_limit {
+            cancellation_token.bail_if_cancelled()?;
             let Some(info_result) = rev_walk.next() else {
-                return;
+                return Ok(());
             };
 
             scanned_in_chunk = scanned_in_chunk.saturating_add(1);
@@ -475,6 +636,7 @@ fn collect_git_authors(
 
         scanned_commits = scanned_commits.saturating_add(scanned_in_chunk);
     }
+    Ok(())
 }
 
 // cli[command.surface.activity-filter]
@@ -487,15 +649,13 @@ fn newest_branch_activity_at(
         return None;
     }
 
-    let sorting = cutoff
-        .and_then(system_time_to_unix_seconds)
-        .map_or(
-            gix::revision::walk::Sorting::ByCommitTime(Default::default()),
-            |seconds| gix::revision::walk::Sorting::ByCommitTimeCutoff {
-                seconds,
-                order: Default::default(),
-            },
-        );
+    let sorting = cutoff.and_then(system_time_to_unix_seconds).map_or(
+        gix::revision::walk::Sorting::ByCommitTime(CommitTimeOrder::default()),
+        |seconds| gix::revision::walk::Sorting::ByCommitTimeCutoff {
+            seconds,
+            order: CommitTimeOrder::default(),
+        },
+    );
 
     let mut walk = repository.rev_walk(tip_ids).sorting(sorting).all().ok()?;
     let newest = walk
@@ -505,9 +665,8 @@ fn newest_branch_activity_at(
 
     match (newest, cutoff) {
         (Some(newest), Some(cutoff)) if newest >= cutoff => Some(newest),
-        (Some(_), Some(_)) => None,
+        (Some(_) | None, Some(_)) => None,
         (newest, None) => newest,
-        (None, Some(_)) => None,
     }
 }
 
@@ -522,8 +681,8 @@ fn branch_tip_ids(repository: &Repository) -> Vec<gix::ObjectId> {
     tip_ids
 }
 
-fn collect_branch_tip_ids<'iter, 'repo>(
-    iter: Option<gix::reference::iter::Iter<'iter, 'repo>>,
+fn collect_branch_tip_ids(
+    iter: Option<gix::reference::iter::Iter<'_, '_>>,
     tip_ids: &mut Vec<gix::ObjectId>,
 ) {
     let Some(iter) = iter else {
@@ -569,10 +728,7 @@ fn next_author_scan_chunk_limit(scanned_commits: usize, config: DiscoveryConfig)
 }
 
 fn format_gix_signature(signature: gix::actor::SignatureRef<'_>) -> Option<String> {
-    format_signature(
-        bstr_to_utf8(signature.name),
-        bstr_to_utf8(signature.email),
-    )
+    format_signature(bstr_to_utf8(signature.name), bstr_to_utf8(signature.email))
 }
 
 fn bstr_to_utf8(value: &gix::bstr::BStr) -> Option<&str> {
@@ -742,6 +898,9 @@ fn merge_partials(
             (Some(value), None) | (None, Some(value)) => Some(value),
             (None, None) => None,
         };
+        entry.is_dirty = merge_optional_bool_or(entry.is_dirty, partial.is_dirty);
+        entry.is_ahead = merge_optional_bool_or(entry.is_ahead, partial.is_ahead);
+        entry.has_upstream = merge_optional_bool_or(entry.has_upstream, partial.has_upstream);
     }
 
     merged
@@ -761,10 +920,21 @@ fn merge_partials(
                 authors: partial.authors.into_iter().collect(),
                 last_activity_on: None,
                 last_activity_ago: None,
+                is_dirty: partial.is_dirty,
+                is_ahead: partial.is_ahead,
             },
             newest_branch_activity_at: partial.newest_branch_activity_at,
+            has_upstream: partial.has_upstream,
         })
         .collect()
+}
+
+fn merge_optional_bool_or(left: Option<bool>, right: Option<bool>) -> Option<bool> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left || right),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
 }
 
 fn project_key(path: &str) -> String {
@@ -788,11 +958,12 @@ mod tests {
     use super::DiscoveredProjectRecord;
     use super::DiscoveryConfig;
     use super::PartialProject;
+    use super::RepoStateRequirements;
     use super::WorkspaceField;
     use super::activity_output_fields;
-    use super::format_signature;
     use super::format_human_duration;
     use super::format_relative_activity;
+    use super::format_signature;
     use super::merge_partials;
     use super::next_author_scan_chunk_limit;
     use super::project_key;
@@ -1008,7 +1179,14 @@ mod tests {
 
     #[test]
     fn discovery_config_treats_zero_max_in_flight_as_unbounded() {
-        let config = DiscoveryConfig::with_overrides(Some(0), Some(8), Some(250), Some(0), None);
+        let config = DiscoveryConfig::with_overrides(
+            Some(0),
+            Some(8),
+            Some(250),
+            Some(0),
+            None,
+            RepoStateRequirements::default(),
+        );
 
         assert_eq!(config.max_in_flight, None);
         assert_eq!(config.author_min_commits, 8);
@@ -1025,6 +1203,7 @@ mod tests {
             author_scan_budget: Duration::ZERO,
             author_scan_chunk_size: 2,
             activity_cutoff: None,
+            repo_state: RepoStateRequirements::default(),
         };
         let started_at = Instant::now() - Duration::from_secs(1);
 
@@ -1041,6 +1220,7 @@ mod tests {
             author_scan_budget: Duration::from_secs(5),
             author_scan_chunk_size: 3,
             activity_cutoff: None,
+            repo_state: RepoStateRequirements::default(),
         };
 
         assert!(should_continue_author_scan(2, Instant::now(), config));
@@ -1059,6 +1239,7 @@ mod tests {
             author_scan_budget: Duration::from_secs(1),
             author_scan_chunk_size: 3,
             activity_cutoff: None,
+            repo_state: RepoStateRequirements::default(),
         };
 
         assert_eq!(next_author_scan_chunk_limit(0, config), 3);
@@ -1131,11 +1312,18 @@ mod tests {
                 ..Default::default()
             },
             newest_branch_activity_at: Some(activity_at),
+            has_upstream: None,
         }
         .into_project_at(now);
 
-        assert_eq!(project.last_activity_on.as_deref(), Some("1970-01-03T00:00:00Z"));
-        assert_eq!(project.last_activity_ago.as_deref(), Some(expected_ago.as_str()));
+        assert_eq!(
+            project.last_activity_on.as_deref(),
+            Some("1970-01-03T00:00:00Z")
+        );
+        assert_eq!(
+            project.last_activity_ago.as_deref(),
+            Some(expected_ago.as_str())
+        );
     }
 
     #[test]

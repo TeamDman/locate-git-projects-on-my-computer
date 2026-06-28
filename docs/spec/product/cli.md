@@ -25,6 +25,24 @@ Author filter matching must treat the provided value as a case-insensitive subst
 cli[command.surface.activity-filter]
 When `--activity` is provided, the CLI must keep only git repositories whose branch tips reach at least one commit newer than now minus the provided humantime duration.
 
+cli[command.surface.repo-state-filters]
+The CLI must support `--ahead`, `--dirty`, `--ahead-or-dirty`, and `--no-upstream` repo-state filters.
+
+cli[command.surface.repo-state-filter-conjunction]
+Repo-state filters must combine with metadata filters by conjunction. Existing name, author, and URL filters keep their OR semantics within the metadata-filter group.
+
+cli[command.surface.dirty-filter]
+When `--dirty` is provided, the CLI must keep only git repositories with staged changes, unstaged tracked changes, or untracked files. Ignored files must not count as dirty.
+
+cli[command.surface.ahead-filter]
+When `--ahead` is provided, the CLI must keep only git repositories with at least one local commit that is not reachable from any remote ref.
+
+cli[command.surface.ahead-or-dirty-filter]
+When `--ahead-or-dirty` is provided, the CLI must keep only git repositories that match either the ahead state or the dirty state.
+
+cli[command.surface.no-upstream-filter]
+When `--no-upstream` is provided, the CLI must keep only repositories whose current HEAD branch has no configured upstream. This filter is separate from ahead detection.
+
 cli[command.surface.default-json]
 When run with no positional arguments or subcommands, the CLI must write a pretty-printed JSON array to stdout.
 
@@ -88,6 +106,12 @@ For discovered git repositories, author scanning must inspect at least the confi
 cli[enrichment.git-author-scan-budget]
 After the configured minimum scan depth is satisfied, git author scanning should stop once the per-repository time budget is exhausted.
 
+cli[enrichment.git-repo-state]
+For discovered git repositories, the implementation must use `gix` rather than shelling out to `git` to gather dirty, ahead, and upstream state.
+
+cli[enrichment.git-repo-state-lazy]
+The implementation should only gather each repo-state value when a requested filter or emitted output field requires that value.
+
 cli[enrichment.cargo-manifest]
 For discovered Cargo projects, the implementation must parse `Cargo.toml` with `facet-toml` and gather package authors plus link metadata such as repository, homepage, and documentation when present.
 
@@ -116,6 +140,12 @@ Each JSON array entry must contain a `last_activity_on` field. When branch activ
 
 cli[output.entry.last-activity-ago]
 Each JSON array entry must contain a `last_activity_ago` field. When branch activity metadata is available, it must describe the same newest discovered commit relative to when the command ran; otherwise it must be `null`.
+
+cli[output.entry.is-dirty]
+Each JSON array entry must contain an `is_dirty` field. For git repositories where dirty state was computed, it must be `true` or `false`; otherwise it must be `null`.
+
+cli[output.entry.is-ahead]
+Each JSON array entry must contain an `is_ahead` field. For git repositories where ahead state was computed, it must be `true` or `false`; otherwise it must be `null`.
 
 cli[output.entry.authors.git-style]
 When both a display name and email are available for an author, the author string should use git-style formatting such as `Name <email@example.com>`.

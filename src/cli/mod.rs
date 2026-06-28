@@ -2,14 +2,16 @@ pub mod facet_shape;
 pub mod global_args;
 
 use crate::cli::global_args::GlobalArgs;
-use crate::discovery::DiscoveryConfig;
 use crate::discovery::DiscoveredProjectRecord;
+use crate::discovery::DiscoveryConfig;
+use crate::discovery::RepoStateRequirements;
 use arbitrary::Arbitrary;
 use eyre::Context;
 use facet::Facet;
 use figue::FigueBuiltins;
 use figue::{self as args};
 use std::time::SystemTime;
+use teamy_cancellation::CancellationToken;
 
 /// Locate source projects on disk and emit structured discovery results.
 ///
@@ -19,8 +21,12 @@ use std::time::SystemTime;
 /// - `TEAMY_MFT_SYNC_DIR` overrides the Teamy MFT sync directory used for indexed discovery.
 /// - `RUST_LOG` provides a tracing filter when `--log-filter` is omitted.
 #[derive(Facet, Arbitrary, Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Figue models boolean CLI flags directly as bool fields."
+)]
 pub struct Cli {
-    /// Global arguments (`debug`, `log_filter`, `log_file`).
+    /// Global arguments (`debug`, `log_filter`, `log_file`, `stop_after`).
     #[facet(flatten)]
     pub global_args: GlobalArgs,
 
@@ -39,6 +45,22 @@ pub struct Cli {
     /// Keep git repositories whose branch activity contains a commit newer than now minus the provided humantime duration.
     #[facet(args::named)]
     pub activity: Option<String>,
+
+    /// Keep git repositories with at least one local commit not reachable from any remote ref.
+    #[facet(args::named, default)]
+    pub ahead: bool,
+
+    /// Keep git repositories with staged changes, unstaged tracked changes, or untracked non-ignored files.
+    #[facet(args::named, default)]
+    pub dirty: bool,
+
+    /// Keep git repositories that are ahead of any remote ref or dirty.
+    #[facet(args::named, default)]
+    pub ahead_or_dirty: bool,
+
+    /// Keep repositories whose current branch has no configured upstream.
+    #[facet(args::named, default)]
+    pub no_upstream: bool,
 
     // cli[command.surface.discovery-tuning-flags]
     /// Maximum number of metadata-enrichment tasks to allow in flight.
@@ -83,6 +105,10 @@ impl PartialEq for Cli {
             && self.author == other.author
             && self.url == other.url
             && self.activity == other.activity
+            && self.ahead == other.ahead
+            && self.dirty == other.dirty
+            && self.ahead_or_dirty == other.ahead_or_dirty
+            && self.no_upstream == other.no_upstream
             && self.enrichment_max_in_flight == other.enrichment_max_in_flight
             && self.author_min_commits == other.author_min_commits
             && self.author_scan_budget_ms == other.author_scan_budget_ms
@@ -98,28 +124,44 @@ impl Cli {
             self.author_scan_budget_ms,
             self.author_scan_chunk_size,
             activity_cutoff_from_now(self.activity.as_deref(), SystemTime::now()),
+            self.repo_state_requirements(),
         )
+    }
+
+    fn repo_state_requirements(&self) -> RepoStateRequirements {
+        RepoStateRequirements {
+            dirty: true,
+            ahead: true,
+            upstream: self.no_upstream,
+        }
     }
 
     /// # Errors
     ///
     /// This function will return an error if the tokio runtime cannot be built or if the command fails.
-    pub fn invoke(self) -> eyre::Result<()> {
+    pub fn invoke(self, cancellation_token: CancellationToken) -> eyre::Result<()> {
         let discovery_config = self.discovery_config();
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .wrap_err("Failed to build tokio runtime")?;
         runtime.block_on(async move {
+            cancellation_token.bail_if_cancelled()?;
             let now = SystemTime::now();
-            let projects = crate::discovery::discover_project_records_with_config(discovery_config)
-                .await?
-                .into_iter()
-                .filter(|record| matches_any_filter(record, &self.name, &self.author, &self.url))
-                .map(|record| record.into_project_at(now))
-                .collect::<Vec<_>>();
+            let projects = crate::discovery::discover_project_records_with_config(
+                discovery_config,
+                cancellation_token.clone(),
+            )
+            .await?
+            .into_iter()
+            .filter(|record| matches_any_filter(record, &self.name, &self.author, &self.url))
+            .filter(|record| matches_repo_state_filters(record, &self))
+            .map(|record| record.into_project_at(now))
+            .collect::<Vec<_>>();
+            cancellation_token.bail_if_cancelled()?;
             let json = facet_json::to_string_pretty(&projects)
                 .wrap_err("Failed to serialize discovery results as JSON")?;
+            cancellation_token.bail_if_cancelled()?;
             println!("{json}");
             eyre::Result::<()>::Ok(())
         })?;
@@ -141,6 +183,23 @@ fn matches_any_filter(
     contains_any_name(&record.project.names, names)
         || contains_any_case_insensitive_substring(&record.project.authors, authors)
         || contains_any(&record.project.outlinks, urls)
+}
+
+fn matches_repo_state_filters(record: &DiscoveredProjectRecord, cli: &Cli) -> bool {
+    matches_required_bool(cli.dirty, record.project.is_dirty)
+        && matches_required_bool(cli.ahead, record.project.is_ahead)
+        && matches_ahead_or_dirty(cli.ahead_or_dirty, record)
+        && matches_required_bool(cli.no_upstream, record.has_upstream.map(|value| !value))
+}
+
+fn matches_ahead_or_dirty(required: bool, record: &DiscoveredProjectRecord) -> bool {
+    !required
+        || record.project.is_ahead.unwrap_or(false)
+        || record.project.is_dirty.unwrap_or(false)
+}
+
+fn matches_required_bool(required: bool, value: Option<bool>) -> bool {
+    !required || value.unwrap_or(false)
 }
 
 fn activity_cutoff_from_now(value: Option<&str>, now: SystemTime) -> Option<SystemTime> {
@@ -194,14 +253,19 @@ fn normalize_name_for_matching(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::Cli;
     use super::activity_cutoff_from_now;
     use super::contains_any;
     use super::contains_any_case_insensitive_substring;
     use super::contains_any_name;
+    use super::matches_ahead_or_dirty;
     use super::matches_any_filter;
+    use super::matches_repo_state_filters;
+    use super::matches_required_bool;
     use super::normalize_name_for_matching;
-    use crate::discovery::DiscoveredProjectRecord;
+    use crate::cli::global_args::GlobalArgs;
     use crate::discovery::DiscoveredProject;
+    use crate::discovery::DiscoveredProjectRecord;
     use std::time::Duration;
     use std::time::SystemTime;
 
@@ -262,6 +326,51 @@ mod tests {
     }
 
     #[test]
+    fn repo_state_filters_are_conjunctive() {
+        let mut project = sample_record();
+        project.project.is_dirty = Some(true);
+        project.project.is_ahead = Some(false);
+        project.has_upstream = Some(false);
+
+        let mut cli = sample_cli();
+        cli.name = vec!["repo-name".to_owned()];
+        cli.dirty = true;
+        cli.no_upstream = true;
+
+        assert!(matches_any_filter(
+            &project,
+            &cli.name,
+            &cli.author,
+            &cli.url
+        ));
+        assert!(matches_repo_state_filters(&project, &cli));
+
+        cli.ahead = true;
+        assert!(!matches_repo_state_filters(&project, &cli));
+    }
+
+    #[test]
+    fn ahead_or_dirty_accepts_either_state() {
+        let mut project = sample_record();
+        project.project.is_dirty = Some(false);
+        project.project.is_ahead = Some(true);
+
+        assert!(matches_ahead_or_dirty(true, &project));
+
+        project.project.is_ahead = Some(false);
+        assert!(!matches_ahead_or_dirty(true, &project));
+        assert!(matches_ahead_or_dirty(false, &project));
+    }
+
+    #[test]
+    fn required_bool_rejects_unknown_state() {
+        assert!(matches_required_bool(false, None));
+        assert!(matches_required_bool(true, Some(true)));
+        assert!(!matches_required_bool(true, Some(false)));
+        assert!(!matches_required_bool(true, None));
+    }
+
+    #[test]
     fn contains_any_uses_exact_membership() {
         assert!(contains_any(&["repo".to_owned()], &["repo".to_owned()]));
         assert!(!contains_any(&["repo".to_owned()], &["rep".to_owned()]));
@@ -313,8 +422,8 @@ mod tests {
     #[test]
     fn activity_cutoff_parses_humantime_relative_to_now() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(86_400 * 5);
-        let cutoff = activity_cutoff_from_now(Some("1day"), now)
-            .expect("humantime value should parse");
+        let cutoff =
+            activity_cutoff_from_now(Some("1day"), now).expect("humantime value should parse");
 
         assert_eq!(cutoff, now - Duration::from_secs(86_400));
     }
@@ -337,8 +446,30 @@ mod tests {
                 authors: vec!["Ada <ada@example.com>".to_owned()],
                 last_activity_on: None,
                 last_activity_ago: None,
+                is_dirty: None,
+                is_ahead: None,
             },
             newest_branch_activity_at: None,
+            has_upstream: None,
+        }
+    }
+
+    fn sample_cli() -> Cli {
+        Cli {
+            global_args: GlobalArgs::default(),
+            name: Vec::new(),
+            author: Vec::new(),
+            url: Vec::new(),
+            activity: None,
+            ahead: false,
+            dirty: false,
+            ahead_or_dirty: false,
+            no_upstream: false,
+            enrichment_max_in_flight: None,
+            author_min_commits: None,
+            author_scan_budget_ms: None,
+            author_scan_chunk_size: None,
+            builtins: Default::default(),
         }
     }
 }
