@@ -61,7 +61,9 @@ The default command emits a pretty-printed JSON array. Each element is intended 
 - `last_activity_on`
 - `last_activity_ago`
 - `is_dirty`
+- `dirty_reason`
 - `is_ahead`
+- `ahead_reason`
 
 ## Environment Variables
 

@@ -144,8 +144,14 @@ Each JSON array entry must contain a `last_activity_ago` field. When branch acti
 cli[output.entry.is-dirty]
 Each JSON array entry must contain an `is_dirty` field. For git repositories where dirty state was computed, it must be `true` or `false`; otherwise it must be `null`.
 
+cli[output.entry.dirty-reason]
+Each JSON array entry must contain a `dirty_reason` field. When `is_dirty` is `true`, it should explain the first discovered dirty status item; otherwise it must be `null`.
+
 cli[output.entry.is-ahead]
 Each JSON array entry must contain an `is_ahead` field. For git repositories where ahead state was computed, it must be `true` or `false`; otherwise it must be `null`.
+
+cli[output.entry.ahead-reason]
+Each JSON array entry must contain an `ahead_reason` field. When `is_ahead` is `true`, it should identify a local commit that is not reachable from any remote ref; otherwise it must be `null`.
 
 cli[output.entry.authors.git-style]
 When both a display name and email are available for an author, the author string should use git-style formatting such as `Name <email@example.com>`.

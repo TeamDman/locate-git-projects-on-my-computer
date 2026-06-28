@@ -1,6 +1,7 @@
 use eyre::Context;
 use facet::Facet;
 use gix::Repository;
+use gix::bstr::ByteSlice;
 use gix::traverse::commit::simple::CommitTimeOrder;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -141,8 +142,12 @@ pub struct DiscoveredProject {
     pub last_activity_ago: Option<String>,
     /// Whether tracked changes, staged changes, or untracked non-ignored files were found.
     pub is_dirty: Option<bool>,
+    /// Explanation for why `is_dirty` is true, or `null` if clean or unknown.
+    pub dirty_reason: Option<String>,
     /// Whether any local commit is not reachable from any remote ref.
     pub is_ahead: Option<bool>,
+    /// Explanation for why `is_ahead` is true, or `null` if not ahead or unknown.
+    pub ahead_reason: Option<String>,
 }
 
 #[derive(Facet, Debug, Clone, PartialEq, Eq, Default)]
@@ -215,7 +220,9 @@ struct PartialProject {
     authors: BTreeSet<String>,
     newest_branch_activity_at: Option<SystemTime>,
     is_dirty: Option<bool>,
+    dirty_reason: Option<String>,
     is_ahead: Option<bool>,
+    ahead_reason: Option<String>,
     has_upstream: Option<bool>,
 }
 
@@ -480,17 +487,21 @@ fn collect_repo_state(
     requirements: RepoStateRequirements,
 ) {
     if requirements.dirty {
-        project.is_dirty = repository_is_dirty(repository);
+        let dirty = repository_dirty_state(repository);
+        project.is_dirty = dirty.is_some().into();
+        project.dirty_reason = dirty;
     }
     if requirements.ahead {
-        project.is_ahead = repository_is_ahead(repository);
+        let ahead = repository_ahead_state(repository);
+        project.is_ahead = ahead.is_some().into();
+        project.ahead_reason = ahead;
     }
     if requirements.upstream {
         project.has_upstream = repository_has_upstream(repository);
     }
 }
 
-fn repository_is_dirty(repository: &Repository) -> Option<bool> {
+fn repository_dirty_state(repository: &Repository) -> Option<String> {
     let mut iter = repository
         .status(gix::progress::Discard)
         .ok()?
@@ -498,23 +509,90 @@ fn repository_is_dirty(repository: &Repository) -> Option<bool> {
         .into_iter(Vec::new())
         .ok()?;
 
-    iter.any(|item| item.is_ok()).into()
+    iter.find_map(|item| item.ok().and_then(dirty_reason_for_status_item))
 }
 
-fn repository_is_ahead(repository: &Repository) -> Option<bool> {
+fn repository_ahead_state(repository: &Repository) -> Option<String> {
     let local_tip_ids = local_tip_ids(repository);
     if local_tip_ids.is_empty() {
-        return Some(false);
+        return None;
     }
 
     let remote_tip_ids = remote_tip_ids(repository);
+    let has_no_remote_refs = remote_tip_ids.is_empty();
     let mut walk = repository
         .rev_walk(local_tip_ids)
         .with_hidden(remote_tip_ids)
         .all()
         .ok()?;
 
-    Some(walk.any(|info| info.is_ok()))
+    let info = walk.find_map(Result::ok)?;
+    Some(format_ahead_reason(repository, info.id, has_no_remote_refs))
+}
+
+fn dirty_reason_for_status_item(item: gix::status::Item) -> Option<String> {
+    match item {
+        gix::status::Item::IndexWorktree(item) => item.summary().map(|summary| {
+            format!(
+                "{}: {}",
+                status_summary_label(summary),
+                status_item_path(&item)
+            )
+        }),
+        gix::status::Item::TreeIndex(change) => Some(format!(
+            "staged change: {}",
+            change.location().to_str_lossy()
+        )),
+    }
+}
+
+fn status_summary_label(summary: gix::status::index_worktree::iter::Summary) -> &'static str {
+    match summary {
+        gix::status::index_worktree::iter::Summary::Removed => "tracked file removed",
+        gix::status::index_worktree::iter::Summary::Added => "untracked file",
+        gix::status::index_worktree::iter::Summary::Modified => "tracked file modified",
+        gix::status::index_worktree::iter::Summary::TypeChange => "tracked file type changed",
+        gix::status::index_worktree::iter::Summary::Renamed => "tracked file renamed",
+        gix::status::index_worktree::iter::Summary::Copied => "tracked file copied",
+        gix::status::index_worktree::iter::Summary::IntentToAdd => "intent-to-add entry",
+        gix::status::index_worktree::iter::Summary::Conflict => "conflicted index entry",
+    }
+}
+
+fn status_item_path(item: &gix::status::index_worktree::Item) -> String {
+    item.rela_path().to_str_lossy().into_owned()
+}
+
+fn format_ahead_reason(
+    repository: &Repository,
+    commit_id: gix::ObjectId,
+    has_no_remote_refs: bool,
+) -> String {
+    let commit = repository.find_commit(commit_id).ok();
+    let subject = commit
+        .as_ref()
+        .map(gix::Commit::message_raw_sloppy)
+        .and_then(first_message_line);
+    let commit = format_commit_for_reason(commit_id, subject.as_deref());
+
+    if has_no_remote_refs {
+        format!("local commit {commit} exists, but no remote refs were found")
+    } else {
+        format!("local commit {commit} is not reachable from any remote ref")
+    }
+}
+
+fn format_commit_for_reason(commit_id: gix::ObjectId, subject: Option<&str>) -> String {
+    match subject {
+        Some(subject) => format!("{commit_id} ({subject})"),
+        None => commit_id.to_string(),
+    }
+}
+
+fn first_message_line(message: &gix::bstr::BStr) -> Option<String> {
+    message
+        .lines()
+        .find_map(|line| normalize_non_empty_string(line.to_str_lossy().as_ref()))
 }
 
 fn repository_has_upstream(repository: &Repository) -> Option<bool> {
@@ -899,7 +977,9 @@ fn merge_partials(
             (None, None) => None,
         };
         entry.is_dirty = merge_optional_bool_or(entry.is_dirty, partial.is_dirty);
+        entry.dirty_reason = merge_optional_string(entry.dirty_reason.take(), partial.dirty_reason);
         entry.is_ahead = merge_optional_bool_or(entry.is_ahead, partial.is_ahead);
+        entry.ahead_reason = merge_optional_string(entry.ahead_reason.take(), partial.ahead_reason);
         entry.has_upstream = merge_optional_bool_or(entry.has_upstream, partial.has_upstream);
     }
 
@@ -921,12 +1001,18 @@ fn merge_partials(
                 last_activity_on: None,
                 last_activity_ago: None,
                 is_dirty: partial.is_dirty,
+                dirty_reason: partial.dirty_reason,
                 is_ahead: partial.is_ahead,
+                ahead_reason: partial.ahead_reason,
             },
             newest_branch_activity_at: partial.newest_branch_activity_at,
             has_upstream: partial.has_upstream,
         })
         .collect()
+}
+
+fn merge_optional_string(left: Option<String>, right: Option<String>) -> Option<String> {
+    left.or(right)
 }
 
 fn merge_optional_bool_or(left: Option<bool>, right: Option<bool>) -> Option<bool> {
@@ -961,6 +1047,8 @@ mod tests {
     use super::RepoStateRequirements;
     use super::WorkspaceField;
     use super::activity_output_fields;
+    use super::first_message_line;
+    use super::format_commit_for_reason;
     use super::format_human_duration;
     use super::format_relative_activity;
     use super::format_signature;
@@ -1270,6 +1358,38 @@ mod tests {
     }
 
     #[test]
+    fn merge_partials_keeps_repo_state_reasons() {
+        let first = PartialProject {
+            path_on_disk: r"C:\Repo".to_owned(),
+            is_dirty: Some(true),
+            dirty_reason: Some("tracked file modified: src/main.rs".to_owned()),
+            ..Default::default()
+        };
+        let second = PartialProject {
+            path_on_disk: r"C:\Repo".to_owned(),
+            is_ahead: Some(true),
+            ahead_reason: Some(
+                "local commit abc123 is not reachable from any remote ref".to_owned(),
+            ),
+            ..Default::default()
+        };
+
+        let merged = merge_partials(vec![first, second], None);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].project.is_dirty, Some(true));
+        assert_eq!(
+            merged[0].project.dirty_reason.as_deref(),
+            Some("tracked file modified: src/main.rs")
+        );
+        assert_eq!(merged[0].project.is_ahead, Some(true));
+        assert_eq!(
+            merged[0].project.ahead_reason.as_deref(),
+            Some("local commit abc123 is not reachable from any remote ref")
+        );
+    }
+
+    #[test]
     fn merge_partials_applies_activity_cutoff() {
         let newer = SystemTime::UNIX_EPOCH + Duration::from_secs(20);
         let older = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
@@ -1337,6 +1457,28 @@ mod tests {
 
         assert!(json.contains("\"last_activity_on\": null"));
         assert!(json.contains("\"last_activity_ago\": null"));
+        assert!(json.contains("\"dirty_reason\": null"));
+        assert!(json.contains("\"ahead_reason\": null"));
+    }
+
+    #[test]
+    fn commit_reasons_include_subject_when_present() {
+        let id = gix::ObjectId::empty_blob(gix::hash::Kind::Sha1);
+
+        assert_eq!(
+            format_commit_for_reason(id, Some("local work")),
+            format!("{id} (local work)")
+        );
+        assert_eq!(format_commit_for_reason(id, None), id.to_string());
+    }
+
+    #[test]
+    fn first_message_line_uses_first_non_empty_line() {
+        assert_eq!(
+            first_message_line(" \nsubject\n\nbody".into()),
+            Some("subject".to_owned())
+        );
+        assert_eq!(first_message_line("\n \n".into()), None);
     }
 
     #[test]
